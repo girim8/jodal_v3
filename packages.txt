@@ -1,0 +1,3 @@
+# packages.txt — APT 패키지 (최소)
+# LibreOffice/unoconv 제거. 한글 PDF 렌더링을 위한 나눔 글꼴만 설치
+fonts-nanum
