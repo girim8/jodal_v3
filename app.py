@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (A안, 1/2)
+# app.py — Streamlit Cloud 단일 파일 통합본 (A안, 2분할 중 1/2)
 # - Secrets(API_KEYS, [[AUTH.users]], CLOUDCONVERT_API_KEY) 안정 파싱
 # - 로그인(팝업 없음) + 관리자 백도어(emp=2855, dob=910518)
 # - 업로드 엑셀(filtered 시트) 로드/필터/차트/다운로드
 # - 첨부 링크 매트릭스 + Compact 카드 UI
-# - **파일 변환 전략(개선): 1) HWP OLE 직접 파서 → 텍스트→간이PDF  2) pyhwp/hwp5txt  3) CloudConvert API → PDF**
-#   (soffice/unoconv 제거)
-# - OpenAI v1/v0.28 호환 call_gpt 래퍼 (proxies 인자 금지)
+# - 파일 변환 전략: 1) HWP/HWPX 로컬 텍스트→간이PDF  2) CloudConvert API → PDF
+# - **OpenAI SDK v1 Responses API 적용 (레거시 ChatCompletion 제거)**
 # - 보고서(.md/.pdf) 생성 + 변환 PDF 묶음 다운로드 + 컨텍스트 챗봇
 # - Python 3.11 기준, Streamlit Cloud 권장 버전은 문서 하단 주석 참고
 
@@ -20,8 +19,6 @@ import shutil
 import requests
 import tempfile
 import subprocess
-import struct
-import zlib
 from io import BytesIO
 from urllib.parse import urlparse, unquote
 from textwrap import dedent
@@ -38,8 +35,8 @@ import plotly.express as px
 st.set_page_config(page_title="조달입찰 분석 시스템", layout="wide", initial_sidebar_state="expanded")
 st.markdown(
     """
-    <meta name=\"robots\" content=\"noindex,nofollow\">
-    <meta name=\"googlebot\" content=\"noindex,nofollow\">
+    <meta name="robots" content="noindex,nofollow">
+    <meta name="googlebot" content="noindex,nofollow">
     """,
     unsafe_allow_html=True,
 )
@@ -54,7 +51,7 @@ for k, v in {
     "chat_messages": [],
     "OPENAI_API_KEY": None,
     "role": None,
-    "svc_filter_seed": ["전용회선", "전화", "인터넷"],
+    "svc_filter_seed": ["전용회선", "전화", "인터넷"],  # 업로드 전 안내용 seed
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -101,44 +98,40 @@ def _get_auth_users_from_secrets() -> list:
     return users
 
 # =============================
-# OpenAI 래퍼 (v1 기본, v0.28 폴백)
+# OpenAI v1 Responses API 래퍼 (레거시 제거)
 # =============================
+
 def _get_openai_client():
-    # v1 우선
+    """OpenAI v1 클라이언트만 사용 (Responses API)."""
     try:
         from openai import OpenAI  # type: ignore
-        key = (
-            st.session_state.get("OPENAI_API_KEY")
-            or (st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None)
-            or (next((k for k in _get_api_keys_from_secrets() if k.startswith("sk-")), None))
-            or os.environ.get("OPENAI_API_KEY")
-        )
-        if not key:
-            return None, True, "API 키 미설정(st.secrets 또는 사이드바에 입력)"
+    except Exception as e:
+        return None, False, f"openai SDK 미설치: {e}"
+    # 키 탐색: 세션 → secrets → env
+    key = (
+        st.session_state.get("OPENAI_API_KEY")
+        or (st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None)
+        or os.environ.get("OPENAI_API_KEY")
+        or (next((k for k in _get_api_keys_from_secrets() if k.startswith("sk-")), None))
+    )
+    if not key:
+        return None, True, "API 키 미설정(st.secrets 또는 사이드바에 입력)"
+    try:
         client = OpenAI(api_key=key)
         return client, True, "OK"
     except Exception as e:
-        # v0.28 폴백(비권장)
-        try:
-            import openai  # type: ignore
-            key = (
-                st.session_state.get("OPENAI_API_KEY")
-                or (st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None)
-                or os.environ.get("OPENAI_API_KEY")
-            )
-            if not key:
-                return None, True, f"API 키 미설정: {e}"
-            openai.api_key = key
-            return openai, True, "LEGACY"
-        except Exception as e2:
-            return None, False, f"openai 미설치/초기화 실패: {e2}"
+        return None, False, f"OpenAI 클라이언트 초기화 실패: {e}"
+
 
 def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
+    """
+    - OpenAI SDK v1 **Responses API** 사용
+    - messages: [{"role":"system|user|assistant", "content":"..."}]
+    - model 예: gpt-4.1, gpt-4.1-mini, gpt-4o, gpt-4o-mini, gpt-5, gpt-5-pro(권한 필요)
+    """
     client, enabled, status = _get_openai_client()
-    if not enabled:
+    if not enabled or client is None:
         raise Exception(f"GPT 비활성 — {status}")
-    if client is None:
-        raise Exception(f"GPT 호출 실패 — {status}")
 
     guardrail_system = {
         "role": "system",
@@ -156,36 +149,43 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
     for m in messages:
         safe_messages.append({"role": m.get("role", "user"), "content": _redact_secrets(m.get("content", ""))})
 
-    # v1 경로
     try:
-        from openai import OpenAI  # noqa: F401
-        resp = client.chat.completions.create(
+        r = client.responses.create(
             model=model,
-            messages=safe_messages,
+            input=[{"role": m.get("role", "user"), "content": m.get("content", "")} for m in safe_messages],
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_output_tokens=max_tokens,
         )
-        return resp.choices[0].message.content
+    except Exception as e:
+        raise Exception(f"Responses 호출 실패: {e}")
+
+    # 가장 호환성 높은 추출 경로
+    try:
+        if hasattr(r, "output_text") and r.output_text:
+            return r.output_text
     except Exception:
         pass
-
-    # v0.28 경로
+    # 보수적 파싱
     try:
-        import openai  # type: ignore
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=safe_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return resp["choices"][0]["message"]["content"]
-    except Exception as e:
-        raise Exception(f"GPT 호출 실패:\n\n{e}")
+        chunks = []
+        outs = getattr(r, "outputs", None)
+        if outs:
+            for o in outs:
+                for c in getattr(o, "content", []):
+                    txt = getattr(c, "text", None)
+                    if txt:
+                        chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks).strip()
+    except Exception:
+        pass
+    raise Exception("Responses 응답 파싱 실패 (output_text/outputs 비어있음)")
 
 # =============================
 # CloudConvert API 헬퍼
 # =============================
 CLOUDCONVERT_API_BASE = "https://api.cloudconvert.com/v2"
+
 
 def _get_cloudconvert_key() -> str | None:
     key = None
@@ -195,11 +195,18 @@ def _get_cloudconvert_key() -> str | None:
         key = None
     return key or os.environ.get("CLOUDCONVERT_API_KEY")
 
+
 @st.cache_data(show_spinner=False)
 def _cloudconvert_supported() -> bool:
     return _get_cloudconvert_key() is not None
 
+
 def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: int = 120) -> tuple[bytes | None, str]:
+    """
+    CloudConvert v2 Jobs API 사용
+    - import/base64 → convert(pdf) → export/url
+    - 완료 후 export URL에서 결과 pdf 다운로드
+    """
     api_key = _get_cloudconvert_key()
     if not api_key:
         return None, "CloudConvert 키 없음(st.secrets.CLOUDCONVERT_API_KEY)"
@@ -271,7 +278,7 @@ def cloudconvert_convert_to_pdf(file_bytes: bytes, filename: str, timeout_sec: i
         return None, f"CloudConvert 다운로드 실패: {e}"
 
 # =============================
-# PDF 텍스트 추출
+# HWP/HWPX 로컬 1차: 텍스트 → 간이PDF
 # =============================
 try:
     from PyPDF2 import PdfReader
@@ -288,106 +295,9 @@ def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     except Exception as e:
         return f"[PDF 추출 실패] {e}"
 
-# =============================
-# HWP 1차: **OLE 직접 파서** → 텍스트 → 간이PDF
-# =============================
-
-def _has_korean(s: str) -> bool:
-    return any('\uac00' <= ch <= '\ud7a3' for ch in s)
-
-def _filter_printable(s: str) -> str:
-    return ''.join(ch for ch in s if ch.isprintable() or ch.isspace())
-
-
-def extract_text_from_hwp_ole(file_bytes: bytes) -> tuple[str | None, str]:
-    """HWP 5.x OLE 구조의 BodyText/SectionN 스트림을 직접 파싱.
-    - 레코드 헤더(4B) → tag_id(하위 10비트), size(상위 12비트)
-    - 텍스트 태그(66,67,68,80) payload를 UTF-16LE 중심으로 복원
-    """
-    try:
-        import olefile  # 런타임 의존
-    except Exception as e:
-        return None, f"olefile 미설치: {e}"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    texts = []
-    sections = 0
-    try:
-        ole = olefile.OleFileIO(tmp_path)
-        for path in ole.listdir():
-            name = '/'.join(path)
-            if not name.startswith('BodyText/Section'):
-                continue
-            sections += 1
-            try:
-                data = ole.openstream(path).read()
-            except Exception:
-                continue
-            # 일부 문서는 zlib raw(헤더 없음)
-            try:
-                data = zlib.decompress(data, -zlib.MAX_WBITS)
-            except Exception:
-                try:
-                    data = zlib.decompress(data)
-                except Exception:
-                    pass
-
-            off = 0
-            L = len(data)
-            while off + 4 <= L:
-                try:
-                    header = struct.unpack('<I', data[off:off+4])[0]
-                except Exception:
-                    break
-                tag_id = header & 0x3FF
-                size = (header >> 20) & 0xFFF
-                off += 4
-                if size < 0 or off + size > L:
-                    break
-                payload = data[off:off+size]
-                off += size
-
-                if tag_id in (66, 67, 68, 80):
-                    try:
-                        t = payload.decode('utf-16le', errors='ignore')
-                    except Exception:
-                        try:
-                            t = payload.decode('cp949', errors='ignore')
-                        except Exception:
-                            t = ''
-                    if t:
-                        t = _filter_printable(t)
-                        if _has_korean(t) or any(ch.isascii() and ch.isalpha() for ch in t):
-                            texts.append(t)
-        ole.close()
-    except Exception as e:
-        return None, f"OLE 파싱 예외: {e}"
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-    merged = '\n'.join(texts).strip()
-    if not merged:
-        return None, "OLE 파싱 결과 비어있음"
-    merged = re.sub(r"\s{3,}", "  ", merged)
-    if len(merged) < 50 or not (_has_korean(merged) or any(ch.isascii() and ch.isalpha() for ch in merged)):
-        return None, "OLE 파싱 텍스트가 너무 짧거나 한글/영문 희박"
-    return merged, f"OK[OLE] 섹션 {sections}개, 길이 {len(merged):,} chars"
-
-# =============================
-# HWP/HWPX: OLE → (실패 시) pyhwp/hwp5txt → 간이PDF  (개선)
-# =============================
 
 def convert_hwp_with_pyhwp(file_bytes: bytes):
-    # 0) OLE 파서 우선
-    t_ole, dbg_ole = extract_text_from_hwp_ole(file_bytes)
-    if t_ole:
-        return (t_ole, dbg_ole)
-
+    """pyhwp 또는 hwp5txt CLI를 통해 텍스트를 얻는다 (환경에 존재할 때만)."""
     # 1) pyhwp 모듈
     try:
         import importlib
@@ -401,8 +311,7 @@ def convert_hwp_with_pyhwp(file_bytes: bytes):
                 try:
                     doc = HWP5File(path)
                     text = doc.text
-                    if text and text.strip():
-                        return (text.strip(), "OK[pyhwp]")
+                    return (text or "").strip(), "OK[pyhwp]"
                 finally:
                     try:
                         os.unlink(path)
@@ -412,7 +321,6 @@ def convert_hwp_with_pyhwp(file_bytes: bytes):
                 pass
     except Exception:
         pass
-
     # 2) hwp5txt CLI
     try:
         exe = shutil.which("hwp5txt") or shutil.which("hwp5txt.py")
@@ -423,9 +331,7 @@ def convert_hwp_with_pyhwp(file_bytes: bytes):
             try:
                 cp = subprocess.run([exe, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
                 if cp.returncode == 0:
-                    out = cp.stdout.decode("utf-8", errors="ignore")
-                    if out and out.strip():
-                        return (out, "OK[hwp5txt]")
+                    return cp.stdout.decode("utf-8", errors="ignore"), "OK[hwp5txt]"
             finally:
                 try:
                     os.unlink(path)
@@ -433,8 +339,7 @@ def convert_hwp_with_pyhwp(file_bytes: bytes):
                     pass
     except Exception:
         pass
-
-    return None, "pyhwp/hwp5txt 텍스트 추출 실패 (OLE 포함)"
+    return None, "pyhwp/hwp5txt 텍스트 추출 실패"
 
 
 def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
@@ -454,9 +359,6 @@ def extract_text_from_hwpx_bytes(file_bytes: bytes) -> str:
     except Exception as e:
         return f"[HWPX 추출 실패] {e}"
 
-# =============================
-# 텍스트 → PDF 간이 생성
-# =============================
 
 def text_to_pdf_bytes_korean(text: str, title: str = ""):
     try:
@@ -507,13 +409,15 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
             return None, f"PDF 생성 실패: {e2}"
 
 # =============================
-# any → PDF 변환 (개선 순서)
+# any → PDF 변환
 # =============================
 ALLOWED_UPLOAD_EXTS = {".pdf",".hwp",".hwpx",".doc",".docx",".ppt",".pptx",".xls",".xlsx",".txt",".csv",".md",".log"}
+
 
 def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, str]:
     ext = (os.path.splitext(filename)[1] or "").lower()
 
+    # 1) HWP (로컬)
     if ext == ".hwp":
         t, dbg = convert_hwp_with_pyhwp(file_bytes)
         if t:
@@ -522,6 +426,7 @@ def convert_any_to_pdf(file_bytes: bytes, filename: str) -> tuple[bytes | None, 
                 return pdf, f"{dbg} → {dbg2}"
         return cloudconvert_convert_to_pdf(file_bytes, filename)
 
+    # 1) HWPX (로컬)
     if ext == ".hwpx":
         t = extract_text_from_hwpx_bytes(file_bytes)
         if t and not t.startswith("[HWPX 추출 실패]"):
@@ -769,7 +674,7 @@ if not st.session_state.get("authed", False):
 render_sidebar_common()
 
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (A안, 2/2)
+# app.py — Streamlit Cloud 단일 파일 통합본 (A안, 2분할 중 2/2)
 # [이 파일은 1/2 바로 아래에 이어 붙이면 하나의 app.py로 동작합니다]
 
 import os
@@ -809,7 +714,7 @@ if "서비스구분" in df.columns:
         "서비스구분 선택",
         options=options,
         default=defaults,
-        key="svc_filter_ms",
+        key="svc_filter_ms",  # seed와 다른 key로 충돌 방지
     )
 else:
     service_selected = []
@@ -866,6 +771,7 @@ if service_selected and "서비스구분" in df_filtered.columns:
 # =============================
 from typing import Tuple
 
+
 def _safe_filename(name: str) -> str:
     name = (name or "").strip().replace("\n", "_").replace("\r", "_")
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
@@ -875,12 +781,14 @@ def _safe_filename(name: str) -> str:
 
 
 def markdown_to_pdf_korean(md_text: str, title: str | None = None):
+    # 1/2의 text_to_pdf_bytes_korean를 그대로 사용
     return text_to_pdf_bytes_korean(md_text, title or "")
 
 # =============================
 # 기본 분석(차트)
 # =============================
 from math import isfinite
+
 
 def render_basic_analysis_charts(base_df: pd.DataFrame):
     def pick_unit(max_val: float):
@@ -1110,7 +1018,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             custom2 = _np.stack([titles_total], axis=-1)
         else:
             import numpy as _np
-            custom2 = _np.stack([pd.Series([""] * len(grp_total))], axis=-1)
+            custom2 = _np.stack([pd.Series([""] * len(grp_total))], axis=-1)  # ✅ 괄호/길이 수정
         fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
         fig_bar.update_traces(
             customdata=custom2,
@@ -1213,7 +1121,7 @@ elif menu_val == "내고객 분석하기":
                 # ===== GPT 분석 =====
                 st.markdown("---")
                 st.subheader("🤖 GPT 분석 (업로드한 파일 자동 변환 포함)")
-                st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — **1차: HWP OLE 텍스트 추출 → 간이PDF**, **2차: pyhwp/hwp5txt**, **3차: CloudConvert API 변환**")
+                st.caption("HWP/HWPX/DOCX/PPTX/XLSX/PDF/TXT/CSV/MD/LOG 지원 — **1차: 로컬 HWP 텍스트 추출 → 간이PDF**, **2차: CloudConvert API 변환**")
                 src_files = st.file_uploader(
                     "분석할 파일 업로드 (여러 개 가능)",
                     type=["pdf", "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt", "csv", "md", "log"],
@@ -1266,7 +1174,7 @@ elif menu_val == "내고객 분석하기":
                 # 새 보고서 생성
                 if st.button("🧠 GPT 분석 보고서 생성", type="primary", use_container_width=True):
                     try:
-                        from openai import OpenAI  # 설치 확인
+                        from openai import OpenAI  # 설치 확인용
                     except Exception:
                         st.error("openai가 설치되어 있지 않습니다. requirements.txt에 openai를 추가하세요.")
                     else:
@@ -1401,3 +1309,21 @@ elif menu_val == "내고객 분석하기":
                         st.chat_message("user").markdown(m["content"])
                     else:
                         st.chat_message("assistant").markdown(m["content"])
+
+# =============================
+# (참고) requirements.txt 권장 버전
+# ------------------------------
+# streamlit==1.39.0
+# pandas==2.2.3
+# numpy==1.26.4
+# openpyxl==3.1.5
+# XlsxWriter==3.2.0
+# plotly==5.24.1
+# openai>=1.47.0
+# PyPDF2==3.0.1
+# reportlab==4.2.5
+# Pillow==10.4.0
+# requests>=2.31.0
+# olefile==0.47
+# (선택) pyhwp==0.1.1  # 또는 hwp5txt CLI가 서버에 설치되어 있으면 사용 가능
+# CloudConvert: st.secrets에 CLOUDCONVERT_API_KEY 필요
