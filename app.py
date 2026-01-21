@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Final Modified Version)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Final Fixed Version)
 # - Features: Upstage OCR, 3-Level Analysis, Full CSS/Dicts
-# - Updates: Chart Sorting/Hover Info, Dataframe Column Ordering
+# - Fixes: Column Ordering in DataEditor, Chart Sorting & Hover Info
 
 import os
 import re
@@ -1498,9 +1498,39 @@ menu_val = st.session_state.get("menu")
 
 if menu_val == "조달입찰결과현황":
     st.title("📑 조달입찰결과현황")
+    
+    # ✅ [수정] 정렬 로직을 최상단으로 이동하여 다운로드와 화면 표시 모두 적용되도록 수정
+    desired_order = [
+        "입찰공고명", "공고명",  
+        "수요기관명", "수요기관", 
+        "대표업체", 
+        "서비스구분", 
+        "투찰금액", 
+        "입찰공고번호", "공고번호", 
+        "year", "month", 
+        "낙찰자선정여부", 
+        "투찰율", 
+        "개찰순위", 
+        "조달방식구분", 
+        "낙찰방법", 
+        "긴급공고여부", "긴급공고",
+        "수요기관지역"
+    ]
+    
+    available_cols = []
+    seen = set()
+    for c in desired_order:
+        if c in df_filtered.columns and c not in seen:
+            available_cols.append(c)
+            seen.add(c)
+            
+    remain_cols = [c for c in df_filtered.columns if c not in seen]
+    df_sorted = df_filtered[available_cols + remain_cols]
+
     dl_buf = BytesIO()
-    df_filtered.to_excel(dl_buf, index=False, engine="openpyxl")
+    df_sorted.to_excel(dl_buf, index=False, engine="openpyxl")
     dl_buf.seek(0)
+    
     st.download_button(
         label="📥 필터링된 데이터 다운로드 (Excel)",
         data=dl_buf,
@@ -1508,20 +1538,16 @@ if menu_val == "조달입찰결과현황":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     
-    # ✅ [수정] 데이터프레임 컬럼 순서 재배치
-    desired_order = ["입찰공고명", "수요기관명", "대표업체", "서비스구분", "투찰금액", 
-                     "입찰공고번호", "year", "month", "낙찰자선정여부", "투찰율", 
-                     "개찰순위", "조달방식구분", "낙찰방법", "긴급공고여부", "수요기관지역"]
-    
-    # 실제 존재하는 컬럼만 선택하고, 나머지 컬럼은 뒤에 붙임
-    available_cols = [c for c in desired_order if c in df_filtered.columns]
-    remain_cols = [c for c in df_filtered.columns if c not in available_cols]
-    df_sorted = df_filtered[available_cols + remain_cols]
-
-    st.data_editor(df_sorted, use_container_width=True, key="result_editor", height=520)
+    # ✅ [수정] Key 변경으로 강제 리렌더링
+    st.data_editor(
+        df_sorted, 
+        use_container_width=True, 
+        key="result_editor_sorted_v1", 
+        height=520
+    )
     
     with st.expander("📊 기본 통계 분석(차트) 열기", expanded=False):
-        render_basic_analysis_charts(df_filtered)
+        render_basic_analysis_charts(df_sorted)
 
 elif menu_val == "내고객 분석하기":
     st.title("🧑‍💼 내고객 분석하기")
