@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# app.py — Streamlit Cloud 단일 파일 통합본 (Final Version for Deployment)
+# app.py — Streamlit Cloud 단일 파일 통합본 (Final Strict Sorting Version)
 # - Features: Upstage OCR, 3-Level Analysis, Full CSS/Dicts
-# - Fixes: Column Ordering Persistence, Chart Sorting & Hover Info
+# - Fixes: DataFrame Column Re-ordering (Strict Construction), Chart Sorting
 
 import os
 import re
@@ -1356,7 +1356,6 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                 with col_total:
                     if title_col:
                         # ✅ [수정] 대표업체, 수요기관명, 투찰율, 서비스구분 정보 추가 수집
-                        # 문자열 컬럼은 첫 번째 값, 숫자는 평균 또는 합으로 집계
                         grp_proj = g.groupby(["연도분기", title_col]).agg({
                             "배정예산금액": "sum",
                             "대표업체": lambda x: x.iloc[0] if len(x) > 0 else "",
@@ -1371,9 +1370,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
                         grp_proj["연"] = grp_proj["연도분기"].str.extract(r"(\d{4})").astype(int)
                         grp_proj["분"] = grp_proj["연도분기"].str.extract(r"Q(\d)").astype(int)
                         
-                        # ✅ [수정] 정렬: 연/분 오름차순, 금액 오름차순 (작은 금액이 아래, 큰 금액이 위 -> 스택 시 큰게 위로?) 
-                        # Plotly Stack Bar는 데이터 순서대로 아래에서부터 쌓습니다.
-                        # 요청: "ascending=[True, True, True]" -> 작은 금액이 먼저 그려져서 아래에 위치
+                        # ✅ [수정] 정렬: 연/분 오름차순, 금액 오름차순 (작은 금액이 아래, 큰 금액이 위)
                         grp_proj = grp_proj.sort_values(["연", "분", "금액"], ascending=[True, True, True]).reset_index(drop=True)
                         
                         fig_proj_stack = px.bar(
@@ -1499,10 +1496,10 @@ menu_val = st.session_state.get("menu")
 if menu_val == "조달입찰결과현황":
     st.title("📑 조달입찰결과현황")
     
-    # ✅ [수정] 정렬 로직 및 강제 컬럼 순서 재배치
-    # 사용자가 요청한 컬럼 순서
-    desired_order = [
-        "입찰공고명", "공고명",  
+    # ✅ [핵심 수정] 화면 표시 및 다운로드를 위한 "강제 정렬 DF 생성 전처리"
+    # 원하는 컬럼 순서 (사용자 지정)
+    target_order = [
+        "입찰공고명", "공고명", 
         "수요기관명", "수요기관", 
         "대표업체", 
         "서비스구분", 
@@ -1518,23 +1515,23 @@ if menu_val == "조달입찰결과현황":
         "수요기관지역"
     ]
     
-    # 1. 실제 존재하는 컬럼만 추출 (중복 제거)
-    available_cols = []
+    # 1. 실제 데이터프레임에 존재하는 컬럼만 필터링 (순서 유지)
+    exist_cols = []
     seen = set()
-    for c in desired_order:
+    for c in target_order:
         if c in df_filtered.columns and c not in seen:
-            available_cols.append(c)
+            exist_cols.append(c)
             seen.add(c)
             
-    # 2. 리스트에 없는 나머지 컬럼들
-    remain_cols = [c for c in df_filtered.columns if c not in seen]
+    # 2. 순서 리스트에 없는 나머지 컬럼들 (맨 뒤로 보냄)
+    other_cols = [c for c in df_filtered.columns if c not in seen]
     
-    # 3. 최종 정렬된 데이터프레임
-    df_sorted = df_filtered[available_cols + remain_cols]
+    # 3. 새로운 DataFrame 변수에 할당 (Deep Copy)
+    df_display = df_filtered[exist_cols + other_cols].copy()
 
-    # [수정] 다운로드 파일도 정렬된 데이터프레임 사용
+    # [수정] 엑셀 다운로드도 정렬된 df_display 사용
     dl_buf = BytesIO()
-    df_sorted.to_excel(dl_buf, index=False, engine="openpyxl")
+    df_display.to_excel(dl_buf, index=False, engine="openpyxl")
     dl_buf.seek(0)
     
     st.download_button(
@@ -1544,16 +1541,16 @@ if menu_val == "조달입찰결과현황":
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     
-    # ✅ [중요 수정] Key를 완전히 변경하여 에디터 설정 초기화 & 정렬된 DF 강제 주입
+    # ✅ [수정] Key 변경하여 강제 리프레시 + 정렬된 df_display 주입
     st.data_editor(
-        df_sorted, 
+        df_display, 
         use_container_width=True, 
-        key="result_view_final_fixed",  # Key 변경됨
+        key="result_view_sorted_final_v2", 
         height=520
     )
     
     with st.expander("📊 기본 통계 분석(차트) 열기", expanded=False):
-        render_basic_analysis_charts(df_sorted)
+        render_basic_analysis_charts(df_display)
 
 elif menu_val == "내고객 분석하기":
     st.title("🧑‍💼 내고객 분석하기")
